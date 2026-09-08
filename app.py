@@ -7,7 +7,7 @@ import re
 import gc  # <--- 新增這行：垃圾回收模組
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 # 允許上傳最大 50 MB 的檔案
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 # 允許上傳最大 100 MB 的檔案
 
 # 短暫紀錄資料庫
 history_db = {}
@@ -2337,25 +2337,25 @@ def index():
                     'max_col': max_col,
                     'excess_rows': excess_rows
                 }
+                
+                # 【修正1】在 for 迴圈的最尾端：每跑完一個工作表，立刻釋放它的記憶體
+                del ws_data
+                del ws_formula
+                gc.collect()
 
+            # 【修正2】當所有工作表 (for 迴圈) 都跑完後，把整個 Excel 檔案從記憶體刪除
+            del wb_data
+            del wb_formula
+            gc.collect()
+
+            # 【修正3】只產生「一次」 uid，存入紀錄後直接回傳渲染
             uid = str(uuid.uuid4())[:8]
             history_db[uid] = {
                 'filename': file.filename,
                 'time': time.strftime("%H:%M:%S"),
                 'sheets': sheets_data
             }
-            del ws_data
-                del ws_formula
-                gc.collect() 
-
-            # 當所有工作表都跑完後，把整個 Excel 檔案從記憶體刪除
-            del wb_data
-            del wb_formula
-            gc.collect()
-
-            uid = str(uuid.uuid4())[:8]
-            # ... 接下來存入 history_db ...
-
+            
             return render_template_string(HTML_TEMPLATE, record=history_db[uid], history=history_db, current_id=uid, get_col_letter=openpyxl.utils.get_column_letter)
 
     if record_id and record_id in history_db:
