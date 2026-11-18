@@ -10,11 +10,11 @@ import os
 import tempfile
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 # 允許上傳最大 100 MB 檔案
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 允許上傳最大 100 MB 檔案
 
 # 資料庫 (全域變數)
 history_db = {}
-tasks_db = {} # 記錄背景運算進度的新資料庫
+tasks_db = {}  # 記錄背景運算進度的新資料庫
 
 def custom_round(value, ndigits=0):
     multiplier = 10 ** ndigits
@@ -23,9 +23,17 @@ def custom_round(value, ndigits=0):
         return int(rounded_val)
     return rounded_val
 
+def get_cell_value_safe(ws, row, col, merged_ranges):
+    """安全讀取儲存格內容（若位於合併儲存格內，自動抓取左上角主格的值）"""
+    for mr in merged_ranges:
+        min_col, min_row, max_mr_col, mr_max_row = mr.bounds
+        if min_row <= row <= mr_max_row and min_col <= col <= max_mr_col:
+            return ws.cell(row=min_row, column=min_col).value
+    return ws.cell(row=row, column=col).value
+
 # 內建農作物數據庫
 CROP_DB = {
-("檸檬", "特小(1-2cm)"): {"unit": "株", "unitArea": 10, "price": 110},
+    ("檸檬", "特小(1-2cm)"): {"unit": "株", "unitArea": 10, "price": 110},
     ("檸檬", "小(2.1-3.5cm)"): {"unit": "株", "unitArea": 10, "price": 1210},
     ("檸檬", "中(3.6-5cm)"): {"unit": "株", "unitArea": 10, "price": 1329},
     ("檸檬", "大(5.1-7cm)"): {"unit": "株", "unitArea": 10, "price": 2658},
@@ -1982,7 +1990,7 @@ HTML_TEMPLATE = """
         body { font-family: '微軟正黑體', sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; color: #333; scroll-behavior: smooth; }
         .header-title { text-align: center; color: #2c3e50; margin-bottom: 20px; }
         .layout-container { display: flex; gap: 20px; max-width: 1400px; margin: auto; align-items: flex-start; }
-        .main-content { flex: 1; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: relative; }
+        .main-content { flex: 1; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: relative; min-width: 0; }
         .upload-box { border: 2px dashed #95a5a6; padding: 30px; text-align: center; border-radius: 10px; margin-bottom: 20px; background: #fafbfc; transition: 0.3s; }
         
         /* 🚀 載入動畫 (Loading Spinner) 樣式 */
@@ -1999,12 +2007,23 @@ HTML_TEMPLATE = """
         .correction-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 4px; overflow: hidden; }
         .correction-table th, .correction-table td { padding: 10px; border: 1px solid #ffeeba; text-align: center; font-size: 14px; }
         .correction-table th { background: #ffe8a1; color: #856404; }
-        .history-panel { width: 320px; background: #fff; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: sticky; top: 20px; }
+        
+        /* 瀏覽紀錄面板與置頂/清除按鈕列 */
+        .history-panel { width: 320px; background: #fff; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: sticky; top: 20px; overflow: hidden; }
+        .panel-actions { display: flex; gap: 8px; padding: 10px 12px; background: #ecf0f1; border-bottom: 1px solid #dcdde1; }
+        .action-btn { flex: 1; padding: 8px 10px; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.2s; font-family: inherit; }
+        .btn-top { background: #2ecc71; color: #fff; }
+        .btn-top:hover { background: #27ae60; }
+        .btn-clear { background: #e74c3c; color: #fff; }
+        .btn-clear:hover { background: #c0392b; }
+        
         .history-header { background: #3498db; color: #fff; padding: 15px; font-size: 16px; font-weight: bold; display: flex; justify-content: space-between; cursor: pointer; }
         .history-content { max-height: 70vh; overflow-y: auto; background: #fdfdfd; }
         .history-item { padding: 12px 15px; border-bottom: 1px solid #eee; display: flex; flex-direction: column; transition: background 0.2s; }
         .history-item:hover { background: #f0f8ff; }
         .history-item.active { background: #e1f0fa; border-left: 4px solid #2980b9; }
+        .history-time { font-size: 12px; color: #7f8c8d; }
+        
         .map-container { overflow-x: auto; border-radius: 8px; border: 1px solid #ddd; margin-top: 15px; }
         .excel-map { border-collapse: collapse; width: 100%; background: #fff; }
         .excel-map th { background-color: #ecf0f1; border: 1px solid #bdc3c7; font-size: 12px; padding: 6px; position: sticky; top: 0; z-index: 2; }
@@ -2012,14 +2031,14 @@ HTML_TEMPLATE = """
         .cell-valid { background-color: #eafaf1; color: #27ae60; }
         .cell-empty { background-color: #f9f9f9; color: #ccc; }
         .cell-error { background-color: #fadbd8; color: #c0392b; border: 2px solid #e74c3c !important; font-weight: bold; cursor: help; }
-        .tooltip { position: absolute; background-color: rgba(0,0,0,0.85); color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 12px; bottom: 120%; left: 50%; transform: translateX(-50%); white-space: nowrap; opacity: 0; visibility: hidden; z-index: 9999; }
+        .tooltip { position: absolute; background-color: rgba(0,0,0,0.85); color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 12px; bottom: 120%; left: 50%; transform: translateX(-50%); white-space: nowrap; opacity: 0; visibility: hidden; z-index: 9999; pointer-events: none; }
         .cell-error:hover .tooltip, .special-warning:hover .tooltip { opacity: 1; visibility: visible; }
         .sheet-container { border: 2px solid #e0e0e0; border-radius: 8px; padding: 20px; margin-bottom: 40px; background: #fafbfc; }
         .sheet-title { margin-top: 0; color: #34495e; border-bottom: 2px solid #bdc3c7; padding: 10px; border-radius: 4px; transition: 0.2s; scroll-margin-top: 20px; cursor: pointer; display: flex; justify-content: space-between; }
         .sheet-title:hover { background-color: #e2e8f0; }
     </style>
 </head>
-<body>
+<body id="pageTop">
     <h2 class="header-title">📊 農林作物調查估價表 - 智能視覺化校對系統</h2>
     <div class="layout-container">
         <div class="main-content">
@@ -2048,13 +2067,11 @@ HTML_TEMPLATE = """
                     
                     document.getElementById('uploadBox').style.display = 'none';
                     document.getElementById('loadingOverlay').style.display = 'block';
-                    // 若畫面上還有舊的報表，將其隱藏
                     if(document.getElementById('reportContainer')) {
                         document.getElementById('reportContainer').style.display = 'none';
                     }
 
                     try {
-                        // 1. 發送檔案給伺服器，取得任務 ID
                         let response = await fetch('/upload', { method: 'POST', body: formData });
                         let data = await response.json();
                         
@@ -2070,7 +2087,6 @@ HTML_TEMPLATE = """
                     }
                 };
 
-                // 2. 每隔 2 秒輪詢背景任務進度
                 async function checkTaskStatus(taskId) {
                     try {
                         let response = await fetch('/status/' + taskId);
@@ -2086,7 +2102,6 @@ HTML_TEMPLATE = """
                         } else if (data.status === 'completed') {
                             document.getElementById('progressText').innerText = "100%";
                             document.getElementById('progressBar').style.width = "100%";
-                            // 運算完成，畫面跳轉至專屬報告結果
                             window.location.href = '/?id=' + data.record_id;
                         } else if (data.status === 'error') {
                             alert("背景運算發生錯誤: " + data.message);
@@ -2101,6 +2116,7 @@ HTML_TEMPLATE = """
                     let content = document.getElementById('historyContent');
                     content.style.display = (content.style.display === 'none') ? 'block' : 'none';
                 }
+
                 function toggleSheet(sheetId) {
                     let content = document.getElementById('content-' + sheetId);
                     let icon = document.getElementById('icon-' + sheetId);
@@ -2112,12 +2128,36 @@ HTML_TEMPLATE = """
                         icon.innerHTML = '▲';
                     }
                 }
+
+                // 需求 3：快速回到最上方點選「選擇檔案」及上傳
+                function scrollToTop() {
+                    const uploadBox = document.getElementById('uploadBox');
+                    if (uploadBox) {
+                        uploadBox.style.display = 'block';
+                    }
+                    window.scrollTo({ top: 0, behavior: 'smooth' });
+                }
+
+                // 需求 4：清除紀錄（附帶確認視窗防誤點）
+                async function confirmClearHistory() {
+                    if (confirm("⚠️ 確定要清除所有瀏覽紀錄與暫存資料嗎？\\n\\n清除後可釋放伺服器記憶體避免卡頓，但已校對的歷史紀錄將無法復原。")) {
+                        try {
+                            let response = await fetch('/clear_history', { method: 'POST' });
+                            let data = await response.json();
+                            if (data.status === 'cleared') {
+                                window.location.href = '/';
+                            }
+                        } catch (err) {
+                            alert("清除紀錄時發生錯誤，請重試。");
+                        }
+                    }
+                }
             </script>
 
             <!-- 渲染報表區塊 (若已完成處理) -->
             {% if record %}
             <div id="reportContainer">
-                <div class="file-info" style="font-size:18px;">📄 本次校對完成：{{ record.filename }}</div>
+                <div class="file-info" style="font-size:18px; margin-bottom: 15px; font-weight: bold;">📄 本次校對完成：{{ record.filename }}</div>
                 {% for sheet_name, s_data in record.sheets.items() %}
                 {% set s_idx = loop.index %}
                 <div class="sheet-container">
@@ -2181,6 +2221,11 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="history-panel">
+            <!-- 需求 3 & 4：瀏覽紀錄上方的「置頂」與「清除紀錄」按鈕 -->
+            <div class="panel-actions">
+                <button type="button" class="action-btn btn-top" onclick="scrollToTop()">⬆️ 置頂 (上傳)</button>
+                <button type="button" class="action-btn btn-clear" onclick="confirmClearHistory()">🗑️ 清除紀錄</button>
+            </div>
             <div class="history-header" onclick="toggleHistory()">
                 <span>📂 瀏覽紀錄</span><span>▼</span>
             </div>
@@ -2217,8 +2262,7 @@ HTML_TEMPLATE = """
 # 背景處理工作緒
 def background_process_excel(task_id, filepath, original_filename):
     try:
-        # 強制開啟 GC 自動回收
-        gc.enable() 
+        gc.enable()
         
         wb_data = openpyxl.load_workbook(filepath, data_only=True)
         wb_formula = openpyxl.load_workbook(filepath, data_only=False)
@@ -2228,7 +2272,6 @@ def background_process_excel(task_id, filepath, original_filename):
         total_sheets = len(sheet_names)
         
         for idx, sheet_name in enumerate(sheet_names):
-            # 更新當前任務進度
             progress = int((idx / total_sheets) * 100)
             tasks_db[task_id]['progress'] = progress
             tasks_db[task_id]['current_sheet'] = sheet_name
@@ -2246,7 +2289,7 @@ def background_process_excel(task_id, filepath, original_filename):
             print_area = ws_data.print_area
             
             if print_area and isinstance(print_area, str):
-                first_area = print_area.split(',')[0] 
+                first_area = print_area.split(',')[0]
                 try:
                     end_coord = first_area.split(':')[1] if ':' in first_area else first_area
                     match = re.search(r'\d+', end_coord)
@@ -2259,23 +2302,83 @@ def background_process_excel(task_id, filepath, original_filename):
                     max_row = min(ws_data.max_row, 78)
                     excess_rows = ws_data.max_row > 78
             else:
-                max_row = min(ws_data.max_row, 78) 
+                max_row = min(ws_data.max_row, 78)
                 excess_rows = ws_data.max_row > 78
             
             merged_ranges = ws_data.merged_cells.ranges
 
+            # 需求 2：讀取 M1 (第1列第13欄) 與 E7 (第7列第5欄) 之內容
+            m1_val = str(get_cell_value_safe(ws_data, 1, 13, merged_ranges) or "").strip()
+            e7_val = str(get_cell_value_safe(ws_data, 7, 5, merged_ranges) or "").strip()
+            is_public_land = ("公有地" in m1_val)
+            is_leased = ("承租" in e7_val)
+
             for row in range(1, max_row + 1):
                 row_calc_errors = {c: [] for c in range(1, max_col + 1)}
-                row_special_flags = {c: False for c in range(1, max_col + 1)} 
+                row_special_flags = {c: False for c in range(1, max_col + 1)}
                 
+                col_A_val = str(ws_data.cell(row=row, column=1).value or "").strip()
                 col_B_val = str(ws_data.cell(row=row, column=2).value or "").strip()
                 col_E_val = str(ws_data.cell(row=row, column=5).value or "").strip()
                 col_F_val = str(ws_data.cell(row=row, column=6).value or "").strip()
-                
+                col_R_val = str(ws_data.cell(row=row, column=18).value or "").strip()
+
+                # 判斷 R 欄是否包含「超植」或「邊緣界址」
+                has_overplant = ("超植" in col_R_val)
+                has_border_issue = ("邊緣界址" in col_R_val)
+                is_j_zero_required = (row >= 10) and (has_overplant or has_border_issue)
+
+                # 判斷 A 欄是否有編號 (第 10 列起且 A 欄有非表頭/非合計之編號內容)
+                has_col_A_id = (
+                    row >= 10 
+                    and col_A_val != "" 
+                    and not any(kw in col_A_val for kw in ["編號", "合計", "小計", "總計", "備註", "說明", "複估"])
+                )
+
+                # ---------------- 【需求 1：R 欄含「超植」或「邊緣界址」時，J 欄應顯示 0】 ----------------
+                if is_j_zero_required:
+                    j_val = ws_data.cell(row=row, column=10).value
+                    if j_val is None or str(j_val).strip() == "":
+                        row_calc_errors[10].append("R欄含超植或邊緣界址，J欄應顯示 0 (目前為空白)")
+                    else:
+                        try:
+                            if abs(float(j_val) - 0) > 0.001:
+                                row_calc_errors[10].append("R欄含超植或邊緣界址，J欄應顯示 0")
+                        except:
+                            row_calc_errors[10].append("格式非數字，J欄應顯示 0")
+
+                # ---------------- 【需求 2：M1 含「公有地」與 E7「承租」對 O 欄之檢核】 ----------------
+                if is_public_land and has_col_A_id:
+                    if has_overplant:
+                        expected_o = 0.0
+                        expected_o_str = "0"
+                        o_err_reason = "R欄含超植，O欄應顯示 0"
+                    elif not is_leased:
+                        expected_o = 0.5
+                        expected_o_str = "0.5"
+                        o_err_reason = "M1含公有地且E7無承租，O欄應為 0.5"
+                    else:
+                        expected_o = 1.0
+                        expected_o_str = "1.0"
+                        o_err_reason = "M1含公有地且E7含承租，O欄應為 1.0"
+
+                    o_cell_val = ws_data.cell(row=row, column=15).value
+                    if o_cell_val is None or str(o_cell_val).strip() == "":
+                        row_calc_errors[15].append(f"{o_err_reason} (目前為空白)")
+                    else:
+                        try:
+                            if abs(float(o_cell_val) - expected_o) > 0.001:
+                                row_calc_errors[15].append(f"數值錯誤 ({o_err_reason})")
+                        except:
+                            row_calc_errors[15].append(f"格式非數字，應為 {expected_o_str}")
+
+                # ---------------- 【合計列檢核】 ----------------
                 if any(kw in col_B_val for kw in ["合計", "複估增加", "複估新增"]):
                     p_val = ws_data.cell(row=row, column=16).value
-                    try: p_val_float = float(p_val) if p_val is not None else 0
-                    except: p_val_float = 0
+                    try:
+                        p_val_float = float(p_val) if p_val is not None else 0
+                    except:
+                        p_val_float = 0
                     
                     if abs(p_val_float - running_correct_p) > 0.1:
                         correction_list.append({
@@ -2284,22 +2387,29 @@ def background_process_excel(task_id, filepath, original_filename):
                             "correct": f"{running_correct_p:,.0f}"
                         })
                         row_calc_errors[16].append("總計金額與系統加總不符")
-                    running_correct_p = 0 
+                    running_correct_p = 0
                 
+                # ---------------- 【農作物資料庫與金額檢核】 ----------------
                 crop_key = (col_E_val, col_F_val)
                 if crop_key in CROP_DB:
                     db = CROP_DB[crop_key]
-                    try: k_qty = float(ws_data.cell(row=row, column=11).value or 0)
-                    except: k_qty = 0
-                    try: o_rate = float(ws_data.cell(row=row, column=15).value or 0)
-                    except: o_rate = 0
+                    try:
+                        k_qty = float(ws_data.cell(row=row, column=11).value or 0)
+                    except:
+                        k_qty = 0
+                    try:
+                        o_rate = float(ws_data.cell(row=row, column=15).value or 0)
+                    except:
+                        o_rate = 0
                         
                     l_val = str(ws_data.cell(row=row, column=12).value or "").strip()
                     m_val = ws_data.cell(row=row, column=13).value
-                    try: m_val = float(m_val) if m_val is not None else 0
-                    except: m_val = 0
+                    try:
+                        m_val = float(m_val) if m_val is not None else 0
+                    except:
+                        m_val = 0
 
-                    if l_val != db["unit"]: 
+                    if l_val != db["unit"]:
                         row_calc_errors[12].append(f"應為「{db['unit']}」")
                     
                     db_price = db["price"]
@@ -2313,30 +2423,36 @@ def background_process_excel(task_id, filepath, original_filename):
                         else:
                             row_calc_errors[13].append(f"應為 {db_price}")
 
-                    correct_j = custom_round(db["unitArea"] * k_qty, ndigits=2)
+                    # 若 R 欄已觸發 J 欄歸零規則，則不再重複檢核 unitArea * k_qty
+                    if not is_j_zero_required:
+                        correct_j = custom_round(db["unitArea"] * k_qty, ndigits=2)
+                        j_val = ws_data.cell(row=row, column=10).value
+                        try:
+                            if abs(float(j_val or 0) - correct_j) > 0.01:
+                                row_calc_errors[10].append(f"數值錯誤，應為 {correct_j}")
+                        except:
+                            row_calc_errors[10].append("格式非數字")
+
                     correct_n = custom_round(k_qty * db["price"], ndigits=0)
                     correct_p = custom_round(correct_n * o_rate, ndigits=0)
 
-                    j_val = ws_data.cell(row=row, column=10).value
-                    try:
-                        if abs(float(j_val or 0) - correct_j) > 0.01: 
-                            row_calc_errors[10].append(f"數值錯誤，應為 {correct_j}")
-                    except: row_calc_errors[10].append("格式非數字")
-
                     n_val = ws_data.cell(row=row, column=14).value
                     try:
-                        if abs(float(n_val or 0) - correct_n) > 0.1: 
+                        if abs(float(n_val or 0) - correct_n) > 0.1:
                             row_calc_errors[14].append(f"運算錯誤，應為 {correct_n}")
-                    except: row_calc_errors[14].append("格式非數字")
+                    except:
+                        row_calc_errors[14].append("格式非數字")
 
                     p_val = ws_data.cell(row=row, column=16).value
                     try:
-                        if abs(float(p_val or 0) - correct_p) > 0.1: 
+                        if abs(float(p_val or 0) - correct_p) > 0.1:
                             row_calc_errors[16].append(f"運算錯誤，應為 {correct_p}")
-                    except: row_calc_errors[16].append("格式非數字")
+                    except:
+                        row_calc_errors[16].append("格式非數字")
 
                     running_correct_p += correct_p
 
+                # ---------------- 【各儲存格格式與格線檢核】 ----------------
                 for col in range(1, max_col + 1):
                     cell_formula = ws_formula.cell(row=row, column=col)
                     cell_data = ws_data.cell(row=row, column=col)
@@ -2354,8 +2470,18 @@ def background_process_excel(task_id, filepath, original_filename):
                                 is_phantom = True
                             break
 
-                    if is_phantom or cell_data.value is None:
+                    if is_phantom:
                         map_data[(row, col)] = {'status': 'empty', 'text': ''}
+                        continue
+
+                    # 若儲存格為空白，但有觸發 J 欄或 O 欄等必填檢核錯誤時，仍須標紅顯示
+                    if cell_data.value is None:
+                        if row_calc_errors[col]:
+                            err_msg = "、".join(row_calc_errors[col])
+                            map_data[(row, col)] = {'status': 'error', 'text': '(空)', 'error': err_msg}
+                            error_list.append(f"❌ {coord}: {err_msg}")
+                        else:
+                            map_data[(row, col)] = {'status': 'empty', 'text': ''}
                         continue
 
                     val_str = str(cell_data.value).strip()
@@ -2370,7 +2496,7 @@ def background_process_excel(task_id, filepath, original_filename):
                     eff_ref_row = 10 + ((eff_bottom_row - 10) % 17) if eff_bottom_row >= 10 else eff_bottom_row
 
                     if col == 1 and row <= 9:
-                        pass 
+                        pass
                     elif row <= 2 and col <= 17:
                         if font_size != 15: errors.append(f"應為 15pt (目前 {font_size}pt)")
                     elif row == 8 and col == 15:
@@ -2382,10 +2508,10 @@ def background_process_excel(task_id, filepath, original_filename):
 
                     is_no_bottom_border = (21 <= eff_ref_row <= 24) or (eff_ref_row == 26)
                     if is_no_bottom_border:
-                        if border and border.bottom and border.bottom.style: errors.append(f"不應有底線")
+                        if border and border.bottom and border.bottom.style: errors.append("不應有底線")
                     else:
                         if row >= 10:
-                            if not border or not border.bottom or not border.bottom.style: errors.append(f"缺底線")
+                            if not border or not border.bottom or not border.bottom.style: errors.append("缺底線")
 
                     display_text = val_str[:4] + '..' if len(val_str) > 4 else val_str
                     
@@ -2406,19 +2532,16 @@ def background_process_excel(task_id, filepath, original_filename):
                 'excess_rows': excess_rows
             }
 
-            # 【資源釋放】每處理完一個 sheet 立刻清理記憶體
             del ws_data
             del ws_formula
             gc.collect()
 
-        # 【資源釋放】關閉並清理整個活頁簿
         wb_data.close()
         wb_formula.close()
         del wb_data
         del wb_formula
         gc.collect()
 
-        # 任務完成，寫入歷史紀錄
         record_id = str(uuid.uuid4())[:8]
         history_db[record_id] = {
             'filename': original_filename,
@@ -2428,14 +2551,17 @@ def background_process_excel(task_id, filepath, original_filename):
         
         tasks_db[task_id]['status'] = 'completed'
         tasks_db[task_id]['record_id'] = record_id
-        
-        # 刪除暫存檔
-        if os.path.exists(filepath):
-            os.remove(filepath)
 
     except Exception as e:
         tasks_db[task_id]['status'] = 'error'
         tasks_db[task_id]['message'] = str(e)
+    finally:
+        # 無論運算成功或發生錯誤，皆確保刪除硬碟上的暫存檔
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except:
+                pass
 
 
 # --- 路由設定 ---
@@ -2453,14 +2579,12 @@ def upload():
     if file and (file.filename.endswith('.xlsx') or file.filename.endswith('.xlsm')):
         task_id = str(uuid.uuid4())
         
-        # 建立暫存檔給背景執行緒讀取
         temp_dir = tempfile.gettempdir()
         filepath = os.path.join(temp_dir, f"{task_id}_{file.filename}")
         file.save(filepath)
         
         tasks_db[task_id] = {'status': 'processing', 'progress': 0, 'current_sheet': ''}
         
-        # 啟動背景執行緒處理
         thread = threading.Thread(target=background_process_excel, args=(task_id, filepath, file.filename))
         thread.start()
         
@@ -2473,6 +2597,16 @@ def task_status(task_id):
     if task:
         return jsonify(task)
     return jsonify({"status": "error", "message": "找不到該任務"})
+
+@app.route("/clear_history", methods=["POST"])
+def clear_history():
+    """清除所有歷史紀錄與已完成的任務快取，並強制回收記憶體"""
+    history_db.clear()
+    finished_tasks = [tid for tid, t in tasks_db.items() if t.get('status') != 'processing']
+    for tid in finished_tasks:
+        del tasks_db[tid]
+    gc.collect()
+    return jsonify({"status": "cleared"})
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
