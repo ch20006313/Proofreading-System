@@ -16,6 +16,50 @@ app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 允許上傳最大 100 M
 history_db = {}
 tasks_db = {}  # 記錄背景運算進度的新資料庫
 
+# ================= 【系統檢核設定區】 =================
+# 需求 1：關閉前版預設的猜測式字體／底線檢查（如需重啟可改為 True）
+ENABLE_STYLE_CHECK = False
+
+# 需求 1：視覺化網格僅顯示 B~C 欄與 J~S 欄
+DISPLAY_COLS = [2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+# 需求 3：自動跳過之工作表名稱關鍵字與完全比對名稱
+SKIP_SHEET_KEYWORDS = ["照片", "附表", "地籍資料", "值"]
+SKIP_SHEET_EXACT_NAMES = {"B"}
+
+# 需求 4：各欄標準欄寬（Excel 畫面顯示值）
+PRESET_COL_WIDTHS = {
+    "B": 19.0,
+    "C": 26.0,
+    "J": 11.5,
+    "K": 15.0,
+    "L": 6.25,
+    "M": 11.0,
+    "N": 11.25,
+    "O": 6.88,
+    "P": 5.0,
+    "Q": 6.38,
+    "R": 13.0,
+    "S": 13.5,
+}
+COL_WIDTH_XML_OFFSET = 0.63   # Excel 底層 XML 留白偏移量 (約 5px / 8px = 0.625)
+COL_WIDTH_TOLERANCE = 0.25    # 欄寬容許誤差，避免不同 DPI 或進位誤報
+
+# 需求 5：R10 之後備註完整性檢核規則 (不含第 9 項，第 9 項採防重疊獨立判讀)
+REMARK_RULES_EXACT = [
+    (["超植"], "超植部分，未予補償"),
+    (["喬木"], "喬木類比照菩提樹"),
+    (["木本"], "木本類比照甘桔及各種甜橙類"),
+    (["草本"], "草本類比照木瓜"),
+    (["蔓性類"], "蔓性類比照葡萄"),
+    (["灌木"], "灌木類比照木槿"),
+    (["椰子類"], "椰子類比照一般觀賞椰子"),
+    (["蔓性植物"], "蔓性植物比照黃金葛"),
+    (["邊緣", "界址"], "位工程用地邊緣界址線上，不計入面積計算"),
+    (["可種植"], "實際可種植面積"),
+]
+# ======================================================
+
 def custom_round(value, ndigits=0):
     multiplier = 10 ** ndigits
     rounded_val = math.floor(value * multiplier + 0.5) / multiplier
@@ -30,6 +74,87 @@ def get_cell_value_safe(ws, row, col, merged_ranges):
         if min_row <= row <= mr_max_row and min_col <= col <= max_mr_col:
             return ws.cell(row=min_row, column=min_col).value
     return ws.cell(row=row, column=col).value
+
+def should_skip_sheet(sheet_name):
+    """需求 3：判斷是否跳過該工作表"""
+    stripped = sheet_name.strip()
+    if stripped in SKIP_SHEET_EXACT_NAMES:
+        return True
+    if "bb" in sheet_name.lower():
+        return True
+    if any(kw in sheet_name for kw in SKIP_SHEET_KEYWORDS):
+        return True
+    return False
+
+def get_column_widths_info(ws, cols):
+    """需求 4：完整展開 Excel 欄寬群組區間，計算換算欄寬與檢核結果"""
+    default_xml_w = ws.sheet_format.defaultColWidth if (ws.sheet_format and ws.sheet_format.defaultColWidth) else 8.38
+    xml_widths = {openpyxl.utils.get_column_letter(c): round(float(default_xml_w), 2) for c in cols}
+
+    for key, dim in ws.column_dimensions.items():
+        if dim.width is None:
+            continue
+        try:
+            start_c = dim.min or openpyxl.utils.column_index_from_string(key)
+            end_c = dim.max or start_c
+        except Exception:
+            continue
+        for c_idx in range(start_c, end_c + 1):
+            if c_idx in cols:
+                xml_widths[openpyxl.utils.get_column_letter(c_idx)] = round(float(dim.width), 2)
+
+    width_report = []
+    width_errors = {}  # {col_letter: err_msg}
+    for c_idx in cols:
+        letter = openpyxl.utils.get_column_letter(c_idx)
+        xml_w = xml_widths[letter]
+        excel_w = round(max(0.0, xml_w - COL_WIDTH_XML_OFFSET), 2)
+        expected_w = PRESET_COL_WIDTHS.get(letter)
+        is_ok = True
+        err_msg = ""
+        if expected_w is not None and abs(excel_w - expected_w) > COL_WIDTH_TOLERANCE:
+            is_ok = False
+            err_msg = f"{letter} 欄寬度不符：目前約 {excel_w} (XML: {xml_w})，標準應為 {expected_w}"
+            width_errors[letter] = err_msg
+        width_report.append({
+            "col": letter,
+            "excel_w": excel_w,
+            "xml_w": xml_w,
+            "expected_w": expected_w,
+            "is_ok": is_ok,
+            "err_msg": err_msg,
+        })
+    return width_report, width_errors
+
+def check_remark_completeness(col_R_val):
+    """需求 5：檢核 R10 起備註欄位 11 項標準用語是否完整"""
+    errors = []
+    if not col_R_val:
+        return errors
+
+    # 檢核第 (1)~(8)、(10)、(11) 項
+    for keywords, expected_phrase in REMARK_RULES_EXACT:
+        if any(kw in col_R_val for kw in keywords):
+            if expected_phrase not in col_R_val:
+                errors.append(f"備註不完整，應包含完整文字「{expected_phrase}」")
+
+    # 獨立檢核第 (9) 項：同時接受半形與全形逗號，並避免第 (10)、(11) 項誤觸「面積」關鍵字
+    rule9_phrases = ("正常種植,最大種植面積", "正常種植，最大種植面積")
+    text_for_rule9 = col_R_val.replace("位工程用地邊緣界址線上，不計入面積計算", "").replace("實際可種植面積", "")
+    has_rule10_or_11_kw = any(kw in text_for_rule9 for kw in ["邊緣", "界址", "可種植"])
+
+    trigger_rule9 = False
+    if "最大" in text_for_rule9:
+        trigger_rule9 = True
+    elif "面積" in text_for_rule9:
+        # 若僅存在邊緣/界址/可種植殘缺字眼且未提「正常種植」，不重複觸發第 9 項
+        if not has_rule10_or_11_kw or "正常種植" in text_for_rule9:
+            trigger_rule9 = True
+
+    if trigger_rule9 and not any(phrase in col_R_val for phrase in rule9_phrases):
+        errors.append("備註不完整，應包含完整文字「正常種植,最大種植面積」或「正常種植，最大種植面積」")
+
+    return errors
 
 # 內建農作物數據庫
 CROP_DB = {
@@ -1050,7 +1175,7 @@ CROP_DB = {
     ("福木", "20公分以上未滿25公分"): {"unit": "株", "unitArea": 3.33, "price": 11011},
     ("福木", "15公分以上未滿20公分"): {"unit": "株", "unitArea": 3.33, "price": 6050},
     ("福木", "10公分以上未滿15公分"): {"unit": "株", "unitArea": 3.33, "price": 3449},
-    ("福木", "5公分以上未滿10公分"): {"unit": "株", "unitArea": 5, "price": 2057},
+    ("福木", "5公分以上未滿10公分"): {"unit": "株", "unitArea": 3.33, "price": 2057},
     ("福木", "1.5公尺以上"): {"unit": "株", "unitArea": 1.67, "price": 809},
     ("福木", "0.5公尺以上未滿1.5公尺"): {"unit": "株", "unitArea": 1.67, "price": 308},
     ("福木", "未滿0.5公尺"): {"unit": "株", "unitArea": 1.67, "price": 61},
@@ -1844,60 +1969,60 @@ CROP_DB = {
     ("青紫木", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 1, "price": 233},
     ("青紫木", "0.5公尺以上未滿1公尺"): {"unit": "株", "unitArea": 1, "price": 116},
     ("青紫木", "未滿0.5公尺"): {"unit": "株", "unitArea": 1, "price": 13},
-    ("九重葛", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 966},
-    ("九重葛", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 930},
-    ("九重葛", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 797},
-    ("九重葛", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 333},
-    ("九重葛", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 133},
-    ("九重葛", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
-    ("黃金葛", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 479},
-    ("黃金葛", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 318},
-    ("黃金葛", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 213},
-    ("黃金葛", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 159},
-    ("黃金葛", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 107},
-    ("黃金葛", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
-    ("蒜香藤", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 1063},
-    ("蒜香藤", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 930},
-    ("蒜香藤", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 797},
-    ("蒜香藤", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 333},
-    ("蒜香藤", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 133},
-    ("蒜香藤", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
-    ("龍吐珠", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 1063},
-    ("龍吐珠", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 930},
-    ("龍吐珠", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 797},
-    ("龍吐珠", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 333},
-    ("龍吐珠", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 133},
-    ("龍吐珠", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
-    ("紫藤", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 1063},
-    ("紫藤", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 930},
-    ("紫藤", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 797},
-    ("紫藤", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 333},
-    ("紫藤", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 133},
-    ("紫藤", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
-    ("炮仗花", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 1063},
-    ("炮仗花", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 930},
-    ("炮仗花", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 797},
-    ("炮仗花", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 333},
-    ("炮仗花", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 133},
-    ("炮仗花", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
-    ("紫鈴藤", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 1063},
-    ("紫鈴藤", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 930},
-    ("紫鈴藤", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 797},
-    ("紫鈴藤", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 333},
-    ("紫鈴藤", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 133},
-    ("紫鈴藤", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
-    ("使君子", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 880},
-    ("使君子", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 847},
-    ("使君子", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 726},
-    ("使君子", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 303},
-    ("使君子", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 121},
-    ("使君子", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 61},
-    ("爬牆虎", "5公尺以上"): {"unit": "株", "unitArea": 0, "price": 479},
-    ("爬牆虎", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea": 0, "price": 318},
-    ("爬牆虎", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea": 0, "price": 213},
-    ("爬牆虎", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea": 0, "price": 159},
-    ("爬牆虎", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea": 0, "price": 107},
-    ("爬牆虎", "未滿1公尺"): {"unit": "株", "unitArea": 0, "price": 67},
+    ("九重葛", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 966},
+    ("九重葛", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 930},
+    ("九重葛", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 797},
+    ("九重葛", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 333},
+    ("九重葛", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 133},
+    ("九重葛", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 67},
+    ("黃金葛", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 479},
+    ("黃金葛", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 318},
+    ("黃金葛", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 213},
+    ("黃金葛", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 159},
+    ("黃金葛", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 107},
+    ("黃金葛", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 67},
+    ("蒜香藤", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 1063},
+    ("蒜香藤", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 930},
+    ("蒜香藤", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 797},
+    ("蒜香藤", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 333},
+    ("蒜香藤", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 133},
+    ("蒜香藤", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 67},
+    ("龍吐珠", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 1063},
+    ("龍吐珠", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 930},
+    ("龍吐珠", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 797},
+    ("龍吐珠", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 333},
+    ("龍吐珠", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 133},
+    ("龍吐珠", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 67},
+    ("紫藤", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 1063},
+    ("紫藤", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 930},
+    ("紫藤", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 797},
+    ("紫藤", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 333},
+    ("紫藤", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 133},
+    ("紫藤", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 67},
+    ("炮仗花", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 1063},
+    ("炮仗花", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 930},
+    ("炮仗花", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 797},
+    ("炮仗花", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 333},
+    ("炮仗花", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 133},
+    ("炮仗花", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 67},
+    ("紫鈴藤", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 1063},
+    ("紫鈴藤", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 930},
+    ("紫鈴藤", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 797},
+    ("紫鈴藤", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 333},
+    ("紫鈴藤", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 133},
+    ("紫鈴藤", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 67},
+    ("使君子", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 880},
+    ("使君子", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 847},
+    ("使君子", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 726},
+    ("使君子", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 303},
+    ("使君子", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 121},
+    ("使君子", "未滿1公尺"): {"unit": "株", "unitArea":0 , "price": 61},
+    ("爬牆虎", "5公尺以上"): {"unit": "株", "unitArea":0 , "price": 479},
+    ("爬牆虎", "4公尺以上未滿5公尺"): {"unit": "株", "unitArea":0 , "price": 318},
+    ("爬牆虎", "3公尺以上未滿4公尺"): {"unit": "株", "unitArea":0 , "price": 213},
+    ("爬牆虎", "2公尺以上未滿3公尺"): {"unit": "株", "unitArea":0 , "price": 159},
+    ("爬牆虎", "1公尺以上未滿2公尺"): {"unit": "株", "unitArea":0 , "price": 107},
+    ("爬牆虎", "未滿1公尺"): {"unit": "株", "unitArea": , "price": 67},
     ("榕樹層型", "35公分以上"): {"unit": "株", "unitArea": 5, "price": 27905},
     ("榕樹層型", "30公分以上未滿35公分"): {"unit": "株", "unitArea": 5, "price": 21925},
     ("榕樹層型", "25公分以上未滿30公分"): {"unit": "株", "unitArea": 5, "price": 11959},
@@ -1987,13 +2112,14 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <title>農林作物調查估價表 - 智能視覺化校對系統 (非同步處理版)</title>
     <style>
-        body { font-family: '微軟正黑體', sans-serif; background-color: #f4f7f6; margin: 0; padding: 20px; color: #333; scroll-behavior: smooth; }
-        .header-title { text-align: center; color: #2c3e50; margin-bottom: 20px; }
-        .layout-container { display: flex; gap: 20px; max-width: 1400px; margin: auto; align-items: flex-start; }
-        .main-content { flex: 1; background: #fff; padding: 30px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: relative; min-width: 0; }
-        .upload-box { border: 2px dashed #95a5a6; padding: 30px; text-align: center; border-radius: 10px; margin-bottom: 20px; background: #fafbfc; transition: 0.3s; }
+        body { font-family: '微軟正黑體', sans-serif; background-color: #f4f7f6; margin: 0; padding: 15px 10px; color: #333; scroll-behavior: smooth; }
+        .header-title { text-align: center; color: #2c3e50; margin: 0 0 15px 0; }
+        /* 需求 1：放大外層容器至螢幕寬度 98% */
+        .layout-container { display: flex; gap: 15px; width: 98%; max-width: 98%; margin: auto; align-items: flex-start; }
+        .main-content { flex: 1; background: #fff; padding: 22px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: relative; min-width: 0; }
+        .upload-box { border: 2px dashed #95a5a6; padding: 24px; text-align: center; border-radius: 10px; margin-bottom: 20px; background: #fafbfc; transition: 0.3s; }
         
-        /* 🚀 載入動畫 (Loading Spinner) 樣式 */
+        /* 載入動畫 */
         #loadingOverlay { display: none; text-align: center; padding: 40px 20px; }
         .spinner { border: 6px solid #f3f3f3; border-top: 6px solid #3498db; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 0 auto 20px auto; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
@@ -2001,39 +2127,52 @@ HTML_TEMPLATE = """
         .progress-bar { height: 100%; background-color: #2ecc71; width: 0%; transition: width 0.4s ease; }
         
         .success { color: #27ae60; font-weight: bold; background: #e9f7ef; padding: 10px; border-radius: 5px; }
+        .skipped-info { background: #eef6fc; border-left: 5px solid #3498db; color: #2c3e50; padding: 10px 14px; border-radius: 5px; margin-bottom: 18px; font-size: 13px; }
         .special-warning { background-color: #f3e5f5 !important; color: #6a1b9a !important; border: 2px solid #9c27b0 !important; }
-        .correction-panel { background: #fff3cd; border-left: 6px solid #ffc107; padding: 15px 20px; border-radius: 6px; margin-bottom: 25px; }
-        .correction-panel h4 { margin-top: 0; color: #856404; font-size: 16px; }
+        .correction-panel { background: #fff3cd; border-left: 6px solid #ffc107; padding: 15px 20px; border-radius: 6px; margin-bottom: 18px; }
+        .correction-panel h4 { margin-top: 0; margin-bottom: 10px; color: #856404; font-size: 15px; }
         .correction-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 4px; overflow: hidden; }
-        .correction-table th, .correction-table td { padding: 10px; border: 1px solid #ffeeba; text-align: center; font-size: 14px; }
+        .correction-table th, .correction-table td { padding: 8px 10px; border: 1px solid #ffeeba; text-align: center; font-size: 13px; }
         .correction-table th { background: #ffe8a1; color: #856404; }
+
+        .width-error-panel { background: #fdecea; border-left: 6px solid #e74c3c; padding: 12px 18px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; color: #922b21; }
+        .width-error-panel h4 { margin: 0 0 8px 0; font-size: 14px; }
+        .width-error-panel ul { margin: 0; padding-left: 20px; line-height: 1.7; }
+
+        .width-inspector { margin-bottom: 14px; border: 1px solid #d5dbdb; border-radius: 6px; background: #fff; }
+        .width-inspector summary { cursor: pointer; padding: 8px 12px; font-size: 13px; font-weight: bold; color: #34495e; background: #f2f4f4; border-radius: 6px; }
+        .width-inspector-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+        .width-inspector-table th, .width-inspector-table td { border: 1px solid #e5e8e8; padding: 6px; text-align: center; }
+        .width-inspector-table th { background: #f8f9f9; }
         
-        /* 瀏覽紀錄面板與置頂/清除按鈕列 */
-        .history-panel { width: 320px; background: #fff; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: sticky; top: 20px; overflow: hidden; }
-        .panel-actions { display: flex; gap: 8px; padding: 10px 12px; background: #ecf0f1; border-bottom: 1px solid #dcdde1; }
-        .action-btn { flex: 1; padding: 8px 10px; border: none; border-radius: 6px; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.2s; font-family: inherit; }
+        /* 需求 1：右側瀏覽紀錄面板寬度縮減至 215px */
+        .history-panel { width: 215px; flex-shrink: 0; background: #fff; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); position: sticky; top: 15px; overflow: hidden; }
+        .panel-actions { display: flex; gap: 6px; padding: 8px; background: #ecf0f1; border-bottom: 1px solid #dcdde1; }
+        .action-btn { flex: 1; padding: 7px 4px; border: none; border-radius: 6px; font-size: 12px; font-weight: bold; cursor: pointer; transition: 0.2s; font-family: inherit; white-space: nowrap; }
         .btn-top { background: #2ecc71; color: #fff; }
         .btn-top:hover { background: #27ae60; }
         .btn-clear { background: #e74c3c; color: #fff; }
         .btn-clear:hover { background: #c0392b; }
         
-        .history-header { background: #3498db; color: #fff; padding: 15px; font-size: 16px; font-weight: bold; display: flex; justify-content: space-between; cursor: pointer; }
-        .history-content { max-height: 70vh; overflow-y: auto; background: #fdfdfd; }
-        .history-item { padding: 12px 15px; border-bottom: 1px solid #eee; display: flex; flex-direction: column; transition: background 0.2s; }
+        .history-header { background: #3498db; color: #fff; padding: 12px 10px; font-size: 14px; font-weight: bold; display: flex; justify-content: space-between; cursor: pointer; }
+        .history-content { max-height: 75vh; overflow-y: auto; background: #fdfdfd; }
+        .history-item { padding: 10px; border-bottom: 1px solid #eee; display: flex; flex-direction: column; transition: background 0.2s; font-size: 12px; word-break: break-all; }
         .history-item:hover { background: #f0f8ff; }
         .history-item.active { background: #e1f0fa; border-left: 4px solid #2980b9; }
-        .history-time { font-size: 12px; color: #7f8c8d; }
+        .history-time { font-size: 11px; color: #7f8c8d; }
         
-        .map-container { overflow-x: auto; border-radius: 8px; border: 1px solid #ddd; margin-top: 15px; }
-        .excel-map { border-collapse: collapse; width: 100%; background: #fff; }
-        .excel-map th { background-color: #ecf0f1; border: 1px solid #bdc3c7; font-size: 12px; padding: 6px; position: sticky; top: 0; z-index: 2; }
-        .excel-map td { border: 1px solid #ecf0f1; height: 30px; min-width: 50px; text-align: center; position: relative; font-size: 12px; }
+        .map-container { overflow-x: auto; border-radius: 8px; border: 1px solid #ddd; margin-top: 12px; }
+        .excel-map { border-collapse: collapse; width: 100%; background: #fff; table-layout: auto; }
+        .excel-map th { background-color: #ecf0f1; border: 1px solid #bdc3c7; font-size: 12px; padding: 7px 6px; position: sticky; top: 0; z-index: 2; }
+        .excel-map th.col-width-error { background-color: #fadbd8; color: #c0392b; border: 2px solid #e74c3c !important; cursor: help; }
+        .excel-map td { border: 1px solid #ecf0f1; height: 30px; min-width: 68px; padding: 2px 5px; text-align: center; position: relative; font-size: 12px; }
         .cell-valid { background-color: #eafaf1; color: #27ae60; }
         .cell-empty { background-color: #f9f9f9; color: #ccc; }
         .cell-error { background-color: #fadbd8; color: #c0392b; border: 2px solid #e74c3c !important; font-weight: bold; cursor: help; }
-        .tooltip { position: absolute; background-color: rgba(0,0,0,0.85); color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 12px; bottom: 120%; left: 50%; transform: translateX(-50%); white-space: nowrap; opacity: 0; visibility: hidden; z-index: 9999; pointer-events: none; }
-        .cell-error:hover .tooltip, .special-warning:hover .tooltip { opacity: 1; visibility: visible; }
-        .sheet-container { border: 2px solid #e0e0e0; border-radius: 8px; padding: 20px; margin-bottom: 40px; background: #fafbfc; }
+        .tooltip { position: absolute; background-color: rgba(0,0,0,0.88); color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 12px; font-weight: normal; bottom: 115%; left: 50%; transform: translateX(-50%); white-space: nowrap; opacity: 0; visibility: hidden; z-index: 9999; pointer-events: none; }
+        .excel-map th .tooltip { bottom: auto; top: 110%; }
+        .cell-error:hover .tooltip, .special-warning:hover .tooltip, th.col-width-error:hover .tooltip { opacity: 1; visibility: visible; }
+        .sheet-container { border: 2px solid #e0e0e0; border-radius: 8px; padding: 18px; margin-bottom: 35px; background: #fafbfc; }
         .sheet-title { margin-top: 0; color: #34495e; border-bottom: 2px solid #bdc3c7; padding: 10px; border-radius: 4px; transition: 0.2s; scroll-margin-top: 20px; cursor: pointer; display: flex; justify-content: space-between; }
         .sheet-title:hover { background-color: #e2e8f0; }
     </style>
@@ -2043,7 +2182,7 @@ HTML_TEMPLATE = """
     <div class="layout-container">
         <div class="main-content">
             
-            <!-- 上傳區塊與 AJAX 非同步上傳腳本 -->
+            <!-- 上傳區塊 -->
             <div class="upload-box" id="uploadBox">
                 <form id="uploadForm">
                     <input type="file" name="excel_file" id="excelFile" accept=".xlsx, .xlsm" required>
@@ -2129,7 +2268,6 @@ HTML_TEMPLATE = """
                     }
                 }
 
-                // 需求 3：快速回到最上方點選「選擇檔案」及上傳
                 function scrollToTop() {
                     const uploadBox = document.getElementById('uploadBox');
                     if (uploadBox) {
@@ -2138,7 +2276,6 @@ HTML_TEMPLATE = """
                     window.scrollTo({ top: 0, behavior: 'smooth' });
                 }
 
-                // 需求 4：清除紀錄（附帶確認視窗防誤點）
                 async function confirmClearHistory() {
                     if (confirm("⚠️ 確定要清除所有瀏覽紀錄與暫存資料嗎？\\n\\n清除後可釋放伺服器記憶體避免卡頓，但已校對的歷史紀錄將無法復原。")) {
                         try {
@@ -2154,10 +2291,21 @@ HTML_TEMPLATE = """
                 }
             </script>
 
-            <!-- 渲染報表區塊 (若已完成處理) -->
+            <!-- 渲染報表區塊 -->
             {% if record %}
             <div id="reportContainer">
-                <div class="file-info" style="font-size:18px; margin-bottom: 15px; font-weight: bold;">📄 本次校對完成：{{ record.filename }}</div>
+                <div class="file-info" style="font-size:18px; margin-bottom: 12px; font-weight: bold;">📄 本次校對完成：{{ record.filename }}</div>
+
+                {% if record.skipped_sheets %}
+                <div class="skipped-info">
+                    ⏭️ 已自動跳過 {{ record.skipped_sheets|length }} 個非估價表工作表：{{ record.skipped_sheets|join('、') }}
+                </div>
+                {% endif %}
+
+                {% if not record.sheets %}
+                    <p style="color: #7f8c8d; padding: 15px; background: #f8f9f9; border-radius: 6px;">ℹ️ 此活頁簿中沒有符合校對條件的工作表（其餘工作表皆已依規則自動跳過）。</p>
+                {% endif %}
+
                 {% for sheet_name, s_data in record.sheets.items() %}
                 {% set s_idx = loop.index %}
                 <div class="sheet-container">
@@ -2170,36 +2318,86 @@ HTML_TEMPLATE = """
                             <p style="color: #c0392b; font-weight: bold; background: #fadbd8; padding: 10px; border-radius: 5px; font-size: 11pt;">⚠️ 注意事項：本工作表未設定列印範圍且資料超過 78 列，系統僅校對前 78 列。</p>
                         {% endif %}
 
+                        <!-- 需求 2 & 合計列黃色警示面板 -->
                         {% if s_data.correction_list %}
                         <div class="correction-panel">
-                            <h4>⚠️ 發現「合計/新增」金額與系統運算不符：</h4>
+                            <h4>⚠️ 發現「合計／面積加總」與系統運算或比對不符：</h4>
                             <table class="correction-table">
-                                <tr><th>列數</th><th>類別 (B欄)</th><th>上傳檔案金額 (P欄)</th><th>系統校驗正確金額</th></tr>
+                                <tr><th>位置 / 列數</th><th>檢核項目</th><th>檔案目前數值</th><th>系統校驗正確值</th></tr>
                                 {% for c in s_data.correction_list %}
                                 <tr>
-                                    <td>第 {{ c.row }} 列</td><td>{{ c.type }}</td>
+                                    <td>{{ c.row }}</td>
+                                    <td>{{ c.type }}</td>
                                     <td style="color:#c0392b; text-decoration: line-through;">{{ c.original }}</td>
-                                    <td style="color:#27ae60; font-weight:bold; font-size:16px;">{{ c.correct }}</td>
+                                    <td style="color:#27ae60; font-weight:bold; font-size:15px;">{{ c.correct }}</td>
                                 </tr>
                                 {% endfor %}
                             </table>
                         </div>
                         {% endif %}
+
+                        <!-- 需求 4：欄寬異常清單 -->
+                        {% if s_data.width_errors %}
+                        <div class="width-error-panel">
+                            <h4>📏 發現以下欄位寬度與標準設定不符（容許誤差 ±{{ width_tol }}）：</h4>
+                            <ul>
+                                {% for col_l, msg in s_data.width_errors.items() %}
+                                    <li>{{ msg }}</li>
+                                {% endfor %}
+                            </ul>
+                        </div>
+                        {% endif %}
+
+                        <!-- 需求 4：可收合各欄欄寬對照表 -->
+                        <details class="width-inspector">
+                            <summary>🔍 展開/收合 B～C、J～S 欄實際欄寬對照表（XML 換算偏移量：{{ width_offset }}）</summary>
+                            <div style="padding: 8px; overflow-x: auto;">
+                                <table class="width-inspector-table">
+                                    <tr>
+                                        <th>欄位</th>
+                                        {% for w in s_data.width_report %}<th>{{ w.col }}</th>{% endfor %}
+                                    </tr>
+                                    <tr>
+                                        <td><strong>標準欄寬</strong></td>
+                                        {% for w in s_data.width_report %}<td>{{ w.expected_w }}</td>{% endfor %}
+                                    </tr>
+                                    <tr>
+                                        <td><strong>換算欄寬</strong></td>
+                                        {% for w in s_data.width_report %}
+                                            <td style="{% if not w.is_ok %}color:#c0392b; font-weight:bold; background:#fadbd8;{% else %}color:#27ae60;{% endif %}">
+                                                {{ w.excel_w }}
+                                            </td>
+                                        {% endfor %}
+                                    </tr>
+                                    <tr>
+                                        <td><strong>XML 原始值</strong></td>
+                                        {% for w in s_data.width_report %}<td style="color:#7f8c8d;">{{ w.xml_w }}</td>{% endfor %}
+                                    </tr>
+                                </table>
+                            </div>
+                        </details>
                         
                         {% if s_data.error_list|length == 0 and not s_data.correction_list %}
-                            <p class="success">✅ 完美！本工作表格式與運算皆完全符合規定。</p>
+                            <p class="success">✅ 完美！本工作表欄寬、備註用語、面積與所有運算皆完全符合規定。</p>
                         {% else %}
-                            <p>💡 滑鼠移至<span style="color:#c0392b; font-weight:bold;">紅色/紫色格子</span>可查看錯誤原因。</p>
+                            <p style="font-size: 13px; margin: 8px 0;">💡 僅顯示 B～C 與 J～S 欄（隱藏欄已於背景完成運算）；滑鼠移至<span style="color:#c0392b; font-weight:bold;">紅色/紫色格子或紅色欄名</span>可查看錯誤原因。</p>
                             <div class="map-container">
                                 <table class="excel-map">
                                     <tr>
-                                        <th></th>
-                                        {% for c in range(1, s_data.max_col + 1) %}<th>{{ get_col_letter(c) }}</th>{% endfor %}
+                                        <th style="min-width: 36px;">列</th>
+                                        {% for c in s_data.display_cols %}
+                                            {% set col_l = get_col_letter(c) %}
+                                            {% set w_err = s_data.width_errors.get(col_l, '') %}
+                                            <th class="{% if w_err %}col-width-error{% endif %}">
+                                                {{ col_l }}{% if w_err %} ⚠️{% endif %}
+                                                {% if w_err %}<div class="tooltip">{{ w_err }}</div>{% endif %}
+                                            </th>
+                                        {% endfor %}
                                     </tr>
                                     {% for r in range(1, s_data.max_row + 1) %}
                                     <tr>
                                         <th>{{ r }}</th>
-                                        {% for c in range(1, s_data.max_col + 1) %}
+                                        {% for c in s_data.display_cols %}
                                             {% set cell = s_data.map_data.get((r, c), {'status': 'empty', 'text': '', 'error': ''}) %}
                                             <td class="{% if cell.status == 'special' %}special-warning{% else %}cell-{{ cell.status }}{% endif %}">
                                                 {{ cell.text }}
@@ -2221,9 +2419,8 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="history-panel">
-            <!-- 需求 3 & 4：瀏覽紀錄上方的「置頂」與「清除紀錄」按鈕 -->
             <div class="panel-actions">
-                <button type="button" class="action-btn btn-top" onclick="scrollToTop()">⬆️ 置頂 (上傳)</button>
+                <button type="button" class="action-btn btn-top" onclick="scrollToTop()">⬆️ 置頂</button>
                 <button type="button" class="action-btn btn-clear" onclick="confirmClearHistory()">🗑️ 清除紀錄</button>
             </div>
             <div class="history-header" onclick="toggleHistory()">
@@ -2236,21 +2433,21 @@ HTML_TEMPLATE = """
                             {{ hist.filename }} <br>
                             <span class="history-time">{{ hist.time }}</span>
                         </div>
-                        <ul style="margin: 8px 0 0 0; padding-left: 15px; font-size: 13px; color: #555;">
+                        <ul style="margin: 6px 0 0 0; padding-left: 14px; font-size: 12px; color: #555;">
                             {% for s_name, s_data in hist.sheets.items() %}
-                                <li onclick="window.location.href='/?id={{ uid }}#sheet-{{ loop.index }}'" style="cursor: pointer; padding: 3px 0; text-decoration: underline;">
+                                <li onclick="window.location.href='/?id={{ uid }}#sheet-{{ loop.index }}'" style="cursor: pointer; padding: 2px 0; text-decoration: underline;">
                                     {{ s_name }} 
                                     {% if s_data.error_list|length == 0 and not s_data.correction_list %}
                                         <span style="color: #27ae60; font-weight: bold;">(✅)</span>
                                     {% else %}
-                                        <span style="color: #c0392b; font-weight: bold;">(❌ {{ s_data.error_list|length + s_data.correction_list|length }} 錯誤)</span>
+                                        <span style="color: #c0392b; font-weight: bold;">(❌ {{ s_data.error_list|length }})</span>
                                     {% endif %}
                                 </li>
                             {% endfor %}
                         </ul>
                     </div>
                 {% else %}
-                    <div style="padding: 15px; text-align: center; color: #999; font-size: 13px;">尚無紀錄</div>
+                    <div style="padding: 15px; text-align: center; color: #999; font-size: 12px;">尚無紀錄</div>
                 {% endfor %}
             </div>
         </div>
@@ -2268,13 +2465,19 @@ def background_process_excel(task_id, filepath, original_filename):
         wb_formula = openpyxl.load_workbook(filepath, data_only=False)
         
         sheets_data = {}
+        skipped_sheets = []
         sheet_names = wb_data.sheetnames
-        total_sheets = len(sheet_names)
+        total_sheets = max(len(sheet_names), 1)
         
         for idx, sheet_name in enumerate(sheet_names):
             progress = int((idx / total_sheets) * 100)
             tasks_db[task_id]['progress'] = progress
             tasks_db[task_id]['current_sheet'] = sheet_name
+
+            # 需求 3：自動跳過特定工作表
+            if should_skip_sheet(sheet_name):
+                skipped_sheets.append(sheet_name)
+                continue
 
             ws_data = wb_data[sheet_name]
             ws_formula = wb_formula[sheet_name]
@@ -2285,29 +2488,109 @@ def background_process_excel(task_id, filepath, original_filename):
             running_correct_p = 0
             max_col = 19
             
+            # 解析列印範圍（支援多頁列印範圍取最大列數）
             excess_rows = False
             print_area = ws_data.print_area
-            
             if print_area and isinstance(print_area, str):
-                first_area = print_area.split(',')[0]
-                try:
-                    end_coord = first_area.split(':')[1] if ':' in first_area else first_area
-                    match = re.search(r'\d+', end_coord)
-                    if match:
-                        max_row = int(match.group())
-                    else:
-                        max_row = min(ws_data.max_row, 78)
-                        excess_rows = ws_data.max_row > 78
-                except:
+                areas = print_area.split(',')
+                found_rows = []
+                for area in areas:
+                    try:
+                        end_coord = area.split(':')[1] if ':' in area else area
+                        match = re.search(r'\d+', end_coord)
+                        if match:
+                            found_rows.append(int(match.group()))
+                    except Exception:
+                        pass
+                if found_rows:
+                    max_row = max(found_rows)
+                else:
                     max_row = min(ws_data.max_row, 78)
                     excess_rows = ws_data.max_row > 78
             else:
                 max_row = min(ws_data.max_row, 78)
                 excess_rows = ws_data.max_row > 78
             
-            merged_ranges = ws_data.merged_cells.ranges
+            merged_ranges = list(ws_data.merged_cells.ranges)
 
-            # 需求 2：讀取 M1 (第1列第13欄) 與 E7 (第7列第5欄) 之內容
+            # ---------------- 【需求 4：檢核 B、C、J~S 欄寬】 ----------------
+            width_report, width_errors = get_column_widths_info(ws_formula, DISPLAY_COLS)
+            for col_l, w_msg in width_errors.items():
+                error_list.append(f"📏 {col_l}欄欄寬: {w_msg}")
+
+            # ---------------- 【需求 2：T 欄「合計」之 V 欄加總驗算與 S7 面積比對】 ----------------
+            s7_extra_errors = []
+            t_total_row = None
+            scan_max_row = min(ws_data.max_row, 500)
+            for r_idx in range(2, scan_max_row + 1):
+                t_val_str = str(ws_data.cell(row=r_idx, column=20).value or "").strip()
+                if "合計" in t_val_str:
+                    t_total_row = r_idx
+                    break
+
+            if t_total_row is not None:
+                v_sum = 0.0
+                for r_idx in range(2, t_total_row):
+                    v_raw = ws_data.cell(row=r_idx, column=22).value
+                    if v_raw is not None and str(v_raw).strip() != "":
+                        try:
+                            v_sum += float(v_raw)
+                        except Exception:
+                            pass
+                v_sum = round(v_sum, 4)
+
+                v_total_raw = ws_data.cell(row=t_total_row, column=22).value
+                s7_raw = get_cell_value_safe(ws_data, 7, 19, merged_ranges)
+
+                try:
+                    v_total_float = float(v_total_raw) if (v_total_raw is not None and str(v_total_raw).strip() != "") else None
+                except Exception:
+                    v_total_float = None
+
+                try:
+                    s7_float = float(s7_raw) if (s7_raw is not None and str(s7_raw).strip() != "") else None
+                except Exception:
+                    s7_float = None
+
+                v_sum_mismatch = (v_total_float is None) or (abs(v_total_float - v_sum) > 0.01)
+                s7_mismatch = (
+                    (s7_float is None)
+                    or (abs(s7_float - v_sum) > 0.01)
+                    or (v_total_float is not None and abs(s7_float - v_total_float) > 0.01)
+                )
+
+                if v_sum_mismatch:
+                    correction_list.append({
+                        "row": f"V{t_total_row} (T{t_total_row}合計)",
+                        "type": f"V2～V{t_total_row - 1} 面積加總驗算",
+                        "original": str(v_total_raw if v_total_raw is not None else "(空)"),
+                        "correct": f"{v_sum:g}"
+                    })
+                    s7_extra_errors.append(
+                        f"T{t_total_row}合計列之 V{t_total_row} ({v_total_raw if v_total_raw is not None else '空'}) 與 V2～V{t_total_row - 1} 加總 ({v_sum:g}) 不符"
+                    )
+
+                if s7_mismatch:
+                    correction_list.append({
+                        "row": "S7",
+                        "type": f"S7 面積與 V2～V{t_total_row - 1} 加總比對",
+                        "original": str(s7_raw if s7_raw is not None else "(空)"),
+                        "correct": f"{v_sum:g}"
+                    })
+                    s7_extra_errors.append(
+                        f"S7 數值 ({s7_raw if s7_raw is not None else '空'}) 與 V2～V{t_total_row - 1} 加總 ({v_sum:g}) 不符"
+                    )
+
+            # 確定 S7 在視覺化網格上的標紅目標位置（支援合併儲存格）
+            s7_target_row, s7_target_col = 7, 19
+            for mr in merged_ranges:
+                min_col, min_row, max_mr_col, mr_max_row = mr.bounds
+                if min_row <= 7 <= mr_max_row and min_col <= 19 <= max_mr_col:
+                    if min_col in DISPLAY_COLS:
+                        s7_target_row, s7_target_col = min_row, min_col
+                    break
+
+            # 讀取 M1 (公有地) 與 E7 (承租)
             m1_val = str(get_cell_value_safe(ws_data, 1, 13, merged_ranges) or "").strip()
             e7_val = str(get_cell_value_safe(ws_data, 7, 5, merged_ranges) or "").strip()
             is_public_land = ("公有地" in m1_val)
@@ -2316,26 +2599,35 @@ def background_process_excel(task_id, filepath, original_filename):
             for row in range(1, max_row + 1):
                 row_calc_errors = {c: [] for c in range(1, max_col + 1)}
                 row_special_flags = {c: False for c in range(1, max_col + 1)}
+
+                # 掛載 S7 面積異常錯誤
+                if row == s7_target_row and s7_extra_errors:
+                    row_calc_errors[s7_target_col].extend(s7_extra_errors)
                 
+                # 完整讀取包含隱藏欄 (A、E、F 等) 在內的數值
                 col_A_val = str(ws_data.cell(row=row, column=1).value or "").strip()
                 col_B_val = str(ws_data.cell(row=row, column=2).value or "").strip()
                 col_E_val = str(ws_data.cell(row=row, column=5).value or "").strip()
                 col_F_val = str(ws_data.cell(row=row, column=6).value or "").strip()
                 col_R_val = str(ws_data.cell(row=row, column=18).value or "").strip()
 
-                # 判斷 R 欄是否包含「超植」或「邊緣界址」
+                # ---------------- 【需求 5：R10 之後備註文字完整性檢核】 ----------------
+                if row >= 10 and col_R_val:
+                    remark_errs = check_remark_completeness(col_R_val)
+                    if remark_errs:
+                        row_calc_errors[18].extend(remark_errs)
+
+                # R 欄含「超植」或「邊緣界址」時，J 欄應顯示 0
                 has_overplant = ("超植" in col_R_val)
                 has_border_issue = ("邊緣界址" in col_R_val)
                 is_j_zero_required = (row >= 10) and (has_overplant or has_border_issue)
 
-                # 判斷 A 欄是否有編號 (第 10 列起且 A 欄有非表頭/非合計之編號內容)
                 has_col_A_id = (
-                    row >= 10 
-                    and col_A_val != "" 
+                    row >= 10
+                    and col_A_val != ""
                     and not any(kw in col_A_val for kw in ["編號", "合計", "小計", "總計", "備註", "說明", "複估"])
                 )
 
-                # ---------------- 【需求 1：R 欄含「超植」或「邊緣界址」時，J 欄應顯示 0】 ----------------
                 if is_j_zero_required:
                     j_val = ws_data.cell(row=row, column=10).value
                     if j_val is None or str(j_val).strip() == "":
@@ -2344,10 +2636,10 @@ def background_process_excel(task_id, filepath, original_filename):
                         try:
                             if abs(float(j_val) - 0) > 0.001:
                                 row_calc_errors[10].append("R欄含超植或邊緣界址，J欄應顯示 0")
-                        except:
+                        except Exception:
                             row_calc_errors[10].append("格式非數字，J欄應顯示 0")
 
-                # ---------------- 【需求 2：M1 含「公有地」與 E7「承租」對 O 欄之檢核】 ----------------
+                # M1 含「公有地」與 E7「承租」對 O 欄之檢核
                 if is_public_land and has_col_A_id:
                     if has_overplant:
                         expected_o = 0.0
@@ -2369,44 +2661,45 @@ def background_process_excel(task_id, filepath, original_filename):
                         try:
                             if abs(float(o_cell_val) - expected_o) > 0.001:
                                 row_calc_errors[15].append(f"數值錯誤 ({o_err_reason})")
-                        except:
+                        except Exception:
                             row_calc_errors[15].append(f"格式非數字，應為 {expected_o_str}")
 
-                # ---------------- 【合計列檢核】 ----------------
+                # B 欄合計列檢核
                 if any(kw in col_B_val for kw in ["合計", "複估增加", "複估新增"]):
                     p_val = ws_data.cell(row=row, column=16).value
                     try:
                         p_val_float = float(p_val) if p_val is not None else 0
-                    except:
+                    except Exception:
                         p_val_float = 0
                     
                     if abs(p_val_float - running_correct_p) > 0.1:
                         correction_list.append({
-                            "row": row, "type": col_B_val,
+                            "row": f"第 {row} 列 (P{row})",
+                            "type": f"B欄：{col_B_val} 金額核對",
                             "original": f"{p_val_float:,.0f}",
                             "correct": f"{running_correct_p:,.0f}"
                         })
                         row_calc_errors[16].append("總計金額與系統加總不符")
                     running_correct_p = 0
                 
-                # ---------------- 【農作物資料庫與金額檢核】 ----------------
+                # 農作物資料庫與金額檢核
                 crop_key = (col_E_val, col_F_val)
                 if crop_key in CROP_DB:
                     db = CROP_DB[crop_key]
                     try:
                         k_qty = float(ws_data.cell(row=row, column=11).value or 0)
-                    except:
+                    except Exception:
                         k_qty = 0
                     try:
                         o_rate = float(ws_data.cell(row=row, column=15).value or 0)
-                    except:
+                    except Exception:
                         o_rate = 0
                         
                     l_val = str(ws_data.cell(row=row, column=12).value or "").strip()
                     m_val = ws_data.cell(row=row, column=13).value
                     try:
                         m_val = float(m_val) if m_val is not None else 0
-                    except:
+                    except Exception:
                         m_val = 0
 
                     if l_val != db["unit"]:
@@ -2423,14 +2716,13 @@ def background_process_excel(task_id, filepath, original_filename):
                         else:
                             row_calc_errors[13].append(f"應為 {db_price}")
 
-                    # 若 R 欄已觸發 J 欄歸零規則，則不再重複檢核 unitArea * k_qty
                     if not is_j_zero_required:
                         correct_j = custom_round(db["unitArea"] * k_qty, ndigits=2)
                         j_val = ws_data.cell(row=row, column=10).value
                         try:
                             if abs(float(j_val or 0) - correct_j) > 0.01:
                                 row_calc_errors[10].append(f"數值錯誤，應為 {correct_j}")
-                        except:
+                        except Exception:
                             row_calc_errors[10].append("格式非數字")
 
                     correct_n = custom_round(k_qty * db["price"], ndigits=0)
@@ -2440,20 +2732,20 @@ def background_process_excel(task_id, filepath, original_filename):
                     try:
                         if abs(float(n_val or 0) - correct_n) > 0.1:
                             row_calc_errors[14].append(f"運算錯誤，應為 {correct_n}")
-                    except:
+                    except Exception:
                         row_calc_errors[14].append("格式非數字")
 
                     p_val = ws_data.cell(row=row, column=16).value
                     try:
                         if abs(float(p_val or 0) - correct_p) > 0.1:
                             row_calc_errors[16].append(f"運算錯誤，應為 {correct_p}")
-                    except:
+                    except Exception:
                         row_calc_errors[16].append("格式非數字")
 
                     running_correct_p += correct_p
 
-                # ---------------- 【各儲存格格式與格線檢核】 ----------------
-                for col in range(1, max_col + 1):
+                # ---------------- 【視覺化網格寫入（僅針對 DISPLAY_COLS 呈現）】 ----------------
+                for col in DISPLAY_COLS:
                     cell_formula = ws_formula.cell(row=row, column=col)
                     cell_data = ws_data.cell(row=row, column=col)
                     coord = cell_formula.coordinate
@@ -2470,12 +2762,16 @@ def background_process_excel(task_id, filepath, original_filename):
                                 is_phantom = True
                             break
 
-                    if is_phantom:
+                    # 若為 S7 強制錯誤提示格，即使原屬合併副格仍顯示錯誤內容
+                    is_forced_s7_err = (row == s7_target_row and col == s7_target_col and len(row_calc_errors[col]) > 0)
+
+                    if is_phantom and not is_forced_s7_err:
                         map_data[(row, col)] = {'status': 'empty', 'text': ''}
                         continue
 
-                    # 若儲存格為空白，但有觸發 J 欄或 O 欄等必填檢核錯誤時，仍須標紅顯示
-                    if cell_data.value is None:
+                    raw_val = get_cell_value_safe(ws_data, row, col, merged_ranges) if is_forced_s7_err else cell_data.value
+
+                    if raw_val is None or str(raw_val).strip() == "":
                         if row_calc_errors[col]:
                             err_msg = "、".join(row_calc_errors[col])
                             map_data[(row, col)] = {'status': 'error', 'text': '(空)', 'error': err_msg}
@@ -2484,36 +2780,40 @@ def background_process_excel(task_id, filepath, original_filename):
                             map_data[(row, col)] = {'status': 'empty', 'text': ''}
                         continue
 
-                    val_str = str(cell_data.value).strip()
-                    font = cell_formula.font
-                    border = cell_formula.border
-                    font_size = font.size if font else None
-                    
+                    val_str = str(raw_val).strip()
                     errors = row_calc_errors[col].copy()
                     is_special = row_special_flags[col]
 
-                    ref_row = 10 + ((row - 10) % 17) if row >= 10 else row
-                    eff_ref_row = 10 + ((eff_bottom_row - 10) % 17) if eff_bottom_row >= 10 else eff_bottom_row
+                    # 需求 1：預設關閉猜測式字體／底線檢查
+                    if ENABLE_STYLE_CHECK:
+                        font = cell_formula.font
+                        border = cell_formula.border
+                        font_size = font.size if font else None
 
-                    if col == 1 and row <= 9:
-                        pass
-                    elif row <= 2 and col <= 17:
-                        if font_size != 15: errors.append(f"應為 15pt (目前 {font_size}pt)")
-                    elif row == 8 and col == 15:
-                        if font_size != 10: errors.append(f"應為 10pt (目前 {font_size}pt)")
-                    elif 21 <= ref_row <= 25 and 3 <= col <= 19:
-                        if font_size != 10: errors.append(f"應為 10pt (目前 {font_size}pt)")
-                    else:
-                        if font_size != 12: errors.append(f"字體應為 12pt (目前 {font_size}pt)")
+                        ref_row = 10 + ((row - 10) % 17) if row >= 10 else row
+                        eff_ref_row = 10 + ((eff_bottom_row - 10) % 17) if eff_bottom_row >= 10 else eff_bottom_row
 
-                    is_no_bottom_border = (21 <= eff_ref_row <= 24) or (eff_ref_row == 26)
-                    if is_no_bottom_border:
-                        if border and border.bottom and border.bottom.style: errors.append("不應有底線")
-                    else:
-                        if row >= 10:
-                            if not border or not border.bottom or not border.bottom.style: errors.append("缺底線")
+                        if col == 1 and row <= 9:
+                            pass
+                        elif row <= 2 and col <= 17:
+                            if font_size != 15: errors.append(f"應為 15pt (目前 {font_size}pt)")
+                        elif row == 8 and col == 15:
+                            if font_size != 10: errors.append(f"應為 10pt (目前 {font_size}pt)")
+                        elif 21 <= ref_row <= 25 and 3 <= col <= 19:
+                            if font_size != 10: errors.append(f"應為 10pt (目前 {font_size}pt)")
+                        else:
+                            if font_size != 12: errors.append(f"字體應為 12pt (目前 {font_size}pt)")
 
-                    display_text = val_str[:4] + '..' if len(val_str) > 4 else val_str
+                        is_no_bottom_border = (21 <= eff_ref_row <= 24) or (eff_ref_row == 26)
+                        if is_no_bottom_border:
+                            if border and border.bottom and border.bottom.style: errors.append("不應有底線")
+                        else:
+                            if row >= 10:
+                                if not border or not border.bottom or not border.bottom.style: errors.append("缺底線")
+
+                    # 因欄位精簡後空間更寬敞，提高截斷字數讓數值與備註更清楚
+                    max_len = 10 if col in (2, 3, 18) else 8
+                    display_text = val_str[:max_len] + '..' if len(val_str) > max_len else val_str
                     
                     if errors:
                         err_msg = "、".join(errors)
@@ -2527,8 +2827,10 @@ def background_process_excel(task_id, filepath, original_filename):
                 'map_data': map_data,
                 'error_list': error_list,
                 'correction_list': correction_list,
+                'width_report': width_report,
+                'width_errors': width_errors,
+                'display_cols': DISPLAY_COLS,
                 'max_row': max_row,
-                'max_col': max_col,
                 'excess_rows': excess_rows
             }
 
@@ -2546,7 +2848,8 @@ def background_process_excel(task_id, filepath, original_filename):
         history_db[record_id] = {
             'filename': original_filename,
             'time': time.strftime("%H:%M:%S"),
-            'sheets': sheets_data
+            'sheets': sheets_data,
+            'skipped_sheets': skipped_sheets
         }
         
         tasks_db[task_id]['status'] = 'completed'
@@ -2556,11 +2859,10 @@ def background_process_excel(task_id, filepath, original_filename):
         tasks_db[task_id]['status'] = 'error'
         tasks_db[task_id]['message'] = str(e)
     finally:
-        # 無論運算成功或發生錯誤，皆確保刪除硬碟上的暫存檔
         if os.path.exists(filepath):
             try:
                 os.remove(filepath)
-            except:
+            except Exception:
                 pass
 
 
@@ -2570,8 +2872,23 @@ def background_process_excel(task_id, filepath, original_filename):
 def index():
     record_id = request.args.get('id')
     if record_id and record_id in history_db:
-        return render_template_string(HTML_TEMPLATE, record=history_db[record_id], history=history_db, current_id=record_id, get_col_letter=openpyxl.utils.get_column_letter)
-    return render_template_string(HTML_TEMPLATE, record=None, history=history_db, current_id=None)
+        return render_template_string(
+            HTML_TEMPLATE,
+            record=history_db[record_id],
+            history=history_db,
+            current_id=record_id,
+            get_col_letter=openpyxl.utils.get_column_letter,
+            width_offset=COL_WIDTH_XML_OFFSET,
+            width_tol=COL_WIDTH_TOLERANCE
+        )
+    return render_template_string(
+        HTML_TEMPLATE,
+        record=None,
+        history=history_db,
+        current_id=None,
+        width_offset=COL_WIDTH_XML_OFFSET,
+        width_tol=COL_WIDTH_TOLERANCE
+    )
 
 @app.route("/upload", methods=["POST"])
 def upload():
