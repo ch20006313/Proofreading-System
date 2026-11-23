@@ -24,7 +24,7 @@ ENABLE_STYLE_CHECK = False
 DISPLAY_COLS = [2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
 # 需求 3：自動跳過之工作表名稱關鍵字與完全比對名稱
-SKIP_SHEET_KEYWORDS = ["照片", "附表", "地籍資料", "值"]
+SKIP_SHEET_KEYWORDS = ["照片", "附表", "持分金額", "持份金額", "地籍資料", "值"]
 SKIP_SHEET_EXACT_NAMES = {"B"}
 
 # 需求 4：各欄標準欄寬（Excel 畫面顯示值）
@@ -114,7 +114,7 @@ def get_column_widths_info(ws, cols):
         err_msg = ""
         if expected_w is not None and abs(excel_w - expected_w) > COL_WIDTH_TOLERANCE:
             is_ok = False
-            err_msg = f"{letter} 欄寬度不符：目前約 {excel_w} (XML: {xml_w})，標準應為 {expected_w}"
+            err_msg = f"{letter}欄寬度不符，標準應為{expected_w}"
             width_errors[letter] = err_msg
         width_report.append({
             "col": letter,
@@ -2335,48 +2335,7 @@ HTML_TEMPLATE = """
                             </table>
                         </div>
                         {% endif %}
-
-                        <!-- 需求 4：欄寬異常清單 -->
-                        {% if s_data.width_errors %}
-                        <div class="width-error-panel">
-                            <h4>📏 發現以下欄位寬度與標準設定不符（容許誤差 ±{{ width_tol }}）：</h4>
-                            <ul>
-                                {% for col_l, msg in s_data.width_errors.items() %}
-                                    <li>{{ msg }}</li>
-                                {% endfor %}
-                            </ul>
-                        </div>
-                        {% endif %}
-
-                        <!-- 需求 4：可收合各欄欄寬對照表 -->
-                        <details class="width-inspector">
-                            <summary>🔍 展開/收合 B～C、J～S 欄實際欄寬對照表（XML 換算偏移量：{{ width_offset }}）</summary>
-                            <div style="padding: 8px; overflow-x: auto;">
-                                <table class="width-inspector-table">
-                                    <tr>
-                                        <th>欄位</th>
-                                        {% for w in s_data.width_report %}<th>{{ w.col }}</th>{% endfor %}
-                                    </tr>
-                                    <tr>
-                                        <td><strong>標準欄寬</strong></td>
-                                        {% for w in s_data.width_report %}<td>{{ w.expected_w }}</td>{% endfor %}
-                                    </tr>
-                                    <tr>
-                                        <td><strong>換算欄寬</strong></td>
-                                        {% for w in s_data.width_report %}
-                                            <td style="{% if not w.is_ok %}color:#c0392b; font-weight:bold; background:#fadbd8;{% else %}color:#27ae60;{% endif %}">
-                                                {{ w.excel_w }}
-                                            </td>
-                                        {% endfor %}
-                                    </tr>
-                                    <tr>
-                                        <td><strong>XML 原始值</strong></td>
-                                        {% for w in s_data.width_report %}<td style="color:#7f8c8d;">{{ w.xml_w }}</td>{% endfor %}
-                                    </tr>
-                                </table>
-                            </div>
-                        </details>
-                        
+                       
                         {% if s_data.error_list|length == 0 and not s_data.correction_list %}
                             <p class="success">✅ 完美！本工作表欄寬、備註用語、面積與所有運算皆完全符合規定。</p>
                         {% else %}
