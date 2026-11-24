@@ -24,7 +24,7 @@ ENABLE_STYLE_CHECK = False
 DISPLAY_COLS = [2, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
 
 # 需求 3：自動跳過之工作表名稱關鍵字與完全比對名稱
-SKIP_SHEET_KEYWORDS = ["照片", "附表", "持分金額", "持份金額", "地籍資料", "值"]
+SKIP_SHEET_KEYWORDS = ["照片", "附表", "範本", "持分金額", "持份金額", "地籍資料", "值"]
 SKIP_SHEET_EXACT_NAMES = {"B"}
 
 # 需求 4：各欄標準欄寬（Excel 畫面顯示值）
